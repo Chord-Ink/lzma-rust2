@@ -4,9 +4,9 @@ use std::{
 };
 
 use lzma_rust2::{
-    LzipOptions, LzipReaderMt, LzipWriter, Lzma2Options, Lzma2Reader, Lzma2ReaderMt, Lzma2Writer,
-    Lzma2WriterMt, LzmaOptions, LzmaReader, LzmaWriter, XzOptions, XzReader, XzReaderMt,
-    XzWriterMt,
+    Action, LzipOptions, LzipReaderMt, LzipWriter, Lzma2Options, Lzma2Reader, Lzma2ReaderMt,
+    Lzma2Writer, Lzma2WriterMt, LzmaOptions, LzmaReader, LzmaWriter, Status, XzOptions, XzReader,
+    XzReaderMt, XzStream, XzWriter, XzWriterMt,
 };
 
 fn regression_lzma2_reader_mt(input_data: &[u8], expected_output: &[u8], dict_size: u32) {
@@ -301,6 +301,13 @@ fn encode_multibyte(mut value: u64) -> Vec<u8> {
 /// larger than the file. The multi-threaded reader must reject it instead of
 /// trying to allocate a buffer of that size.
 fn xz_with_huge_index_record(unpadded_size: u64) -> Vec<u8> {
+    let mut record = encode_multibyte(unpadded_size);
+    record.extend_from_slice(&encode_multibyte(0));
+    xz_with_index(1, &record)
+}
+
+/// A crafted XZ stream with no blocks and the given index content.
+fn xz_with_index(record_count: u64, records: &[u8]) -> Vec<u8> {
     let mut stream = Vec::new();
 
     stream.extend_from_slice(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]);
@@ -309,9 +316,8 @@ fn xz_with_huge_index_record(unpadded_size: u64) -> Vec<u8> {
     stream.extend_from_slice(&crc32(&stream_flags).to_le_bytes());
 
     let mut index_body = vec![0x00];
-    index_body.extend_from_slice(&encode_multibyte(1));
-    index_body.extend_from_slice(&encode_multibyte(unpadded_size));
-    index_body.extend_from_slice(&encode_multibyte(0));
+    index_body.extend_from_slice(&encode_multibyte(record_count));
+    index_body.extend_from_slice(records);
     while index_body.len() % 4 != 0 {
         index_body.push(0);
     }
@@ -343,6 +349,158 @@ fn xz_mt_huge_index_record_does_not_oom() {
     let mut reader = XzReaderMt::new(std::io::Cursor::new(input), false, 2).unwrap();
     let mut output = Vec::new();
     assert!(reader.read_to_end(&mut output).is_err());
+}
+
+/// A forged index record count must not reserve memory before any record is
+/// read. This count would reserve 128 MB.
+#[test]
+fn xz_index_record_count_does_not_reserve_memory() {
+    let mut input = xz_one_byte()[..12].to_vec();
+    input.push(0);
+    input.extend_from_slice(&encode_multibyte(8_000_000));
+    let peak = allocation_tracking::peak(|| {
+        let mut output = Vec::new();
+        let error = XzReader::new(input.as_slice(), false)
+            .read_to_end(&mut output)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    });
+    assert!(peak < 1 << 20, "peak {peak}");
+
+    let input = xz_with_index(8_000_000, &[]);
+    let peak = allocation_tracking::peak(|| {
+        assert!(XzReaderMt::new(std::io::Cursor::new(input.clone()), false, 1).is_err());
+    });
+    assert!(peak < 1 << 20, "peak {peak}");
+}
+
+/// liblzma rejects a footer whose backward size is not the size of the index.
+#[test]
+fn xz_rejects_wrong_backward_size() {
+    let xz = xz_one_byte();
+    let backward_size = u32::from_le_bytes(xz[xz.len() - 8..xz.len() - 4].try_into().unwrap());
+    for wrong in [backward_size - 1, backward_size + 1] {
+        let mut input = xz.clone();
+        set_xz_backward_size(&mut input, wrong);
+        assert_xz_rejected(&input);
+    }
+
+    // An index that doesn't fill the space the backward size gives it.
+    let mut input = xz_with_index(0, &[]);
+    let n = input.len();
+    input.splice(n - 12..n - 12, [0; 4]);
+    set_xz_backward_size(&mut input, 2);
+    assert!(XzReaderMt::new(std::io::Cursor::new(input.clone()), false, 1).is_err());
+    assert_xz_rejected(&input);
+}
+
+/// liblzma rejects an index whose record sizes differ from the decoded block.
+#[test]
+fn xz_rejects_index_that_disagrees_with_blocks() {
+    let xz = xz_one_byte();
+    let index = xz_index_start(&xz);
+    let unpadded_size = xz[index + 2];
+    // The indicator, the record count, and the unpadded and uncompressed sizes.
+    assert_eq!(xz[index..index + 4], [0, 1, unpadded_size, 1]);
+
+    for (offset, value) in [(2, unpadded_size + 4), (3, 2)] {
+        let mut input = xz.clone();
+        input[index + offset] = value;
+        let n = input.len();
+        let crc = crc32(&input[index..n - 16]);
+        input[n - 16..n - 12].copy_from_slice(&crc.to_le_bytes());
+        assert_xz_rejected(&input);
+    }
+}
+
+/// liblzma rejects sizes in a block header that differ from the block.
+#[test]
+fn xz_rejects_block_header_sizes_that_disagree_with_block() {
+    let xz = xz_one_byte();
+    // A 12-byte block header with one LZMA2 filter and no sizes, and a CRC64 check.
+    assert_eq!(xz[12..16], [2, 0, 0x21, 1]);
+    let compressed_size = xz[xz_index_start(&xz) + 2] - 12 - 8;
+
+    let with_sizes = |compressed_size: u8, uncompressed_size: u8| {
+        let mut header = vec![
+            2,
+            0xC0,
+            compressed_size,
+            uncompressed_size,
+            0x21,
+            1,
+            xz[16],
+            0,
+        ];
+        header.extend_from_slice(&crc32(&header).to_le_bytes());
+        let mut input = xz.clone();
+        input[12..24].copy_from_slice(&header);
+        input
+    };
+
+    let input = with_sizes(compressed_size, 1);
+    let mut output = Vec::new();
+    XzReader::new(input.as_slice(), false)
+        .read_to_end(&mut output)
+        .unwrap();
+    assert_eq!(output, b"x");
+    assert_eq!(decode_with_xz_stream(&input).unwrap(), b"x");
+
+    for input in [
+        with_sizes(compressed_size + 1, 1),
+        with_sizes(compressed_size - 1, 1),
+        with_sizes(compressed_size, 2),
+        with_sizes(compressed_size, 0),
+    ] {
+        assert_xz_rejected(&input);
+    }
+}
+
+fn xz_one_byte() -> Vec<u8> {
+    let mut options = XzOptions::with_preset(0);
+    options.lzma_options.dict_size = 4096;
+    let mut writer = XzWriter::new(Vec::new(), options).unwrap();
+    writer.write_all(b"x").unwrap();
+    writer.finish().unwrap()
+}
+
+fn xz_index_start(xz: &[u8]) -> usize {
+    let n = xz.len();
+    let backward_size = u32::from_le_bytes(xz[n - 8..n - 4].try_into().unwrap());
+    n - 12 - (backward_size as usize + 1) * 4
+}
+
+fn set_xz_backward_size(xz: &mut [u8], backward_size: u32) {
+    let n = xz.len();
+    xz[n - 8..n - 4].copy_from_slice(&backward_size.to_le_bytes());
+    let crc = crc32(&xz[n - 8..n - 2]);
+    xz[n - 12..n - 8].copy_from_slice(&crc.to_le_bytes());
+}
+
+fn assert_xz_rejected(input: &[u8]) {
+    let mut output = Vec::new();
+    let error = XzReader::new(input, false)
+        .read_to_end(&mut output)
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+
+    let error = decode_with_xz_stream(input).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+}
+
+fn decode_with_xz_stream(input: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut stream = XzStream::new(false);
+    let mut output = Vec::new();
+    let mut buffer = [0; 64];
+    let mut rest = input;
+    loop {
+        let result = stream.process(rest, &mut buffer, Action::Finish)?;
+        rest = &rest[result.bytes_consumed..];
+        output.extend_from_slice(&buffer[..result.bytes_produced]);
+        if result.status == Status::StreamEnd {
+            return Ok(output);
+        }
+    }
 }
 
 struct FaultyReader {

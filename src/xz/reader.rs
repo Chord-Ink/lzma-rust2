@@ -183,7 +183,9 @@ pub struct XzReader<R: Read> {
     checksum_calculator: Option<ChecksumCalculator>,
     finished: bool,
     allow_multiple_streams: bool,
-    blocks_processed: u64,
+    block_header: Option<BlockHeader>,
+    block_uncompressed_size: u64,
+    blocks: Vec<IndexRecord>,
     mem_limit_kb: u32,
 }
 
@@ -208,7 +210,9 @@ impl<R: Read> XzReader<R> {
             checksum_calculator: None,
             finished: false,
             allow_multiple_streams,
-            blocks_processed: 0,
+            block_header: None,
+            block_uncompressed_size: 0,
+            blocks: Vec::new(),
             mem_limit_kb,
         }
     }
@@ -261,7 +265,7 @@ impl<R: Read> XzReader<R> {
                     }
                 }
 
-                self.blocks_processed += 1;
+                self.block_header = Some(block_header);
 
                 Ok(true)
             }
@@ -393,22 +397,59 @@ impl<R: Read> XzReader<R> {
 
             // Reset state for new stream.
             self.stream_header = Some(stream_header);
-            self.blocks_processed = 0;
+            self.blocks.clear();
 
             return Ok(true);
         }
     }
 
-    fn parse_index_and_footer(&mut self) -> Result<()> {
-        let index = Index::parse(&mut self.reader)?;
+    /// Records the finished block for the index check, after checking the sizes its
+    /// header declares.
+    fn finish_block(&mut self, compressed_size: u64) -> Result<()> {
+        let header = self.block_header.take().expect("block_header not set");
+        let uncompressed_size = core::mem::take(&mut self.block_uncompressed_size);
 
-        if index.number_of_records != self.blocks_processed {
+        if header
+            .compressed_size
+            .is_some_and(|size| size != compressed_size)
+            || header
+                .uncompressed_size
+                .is_some_and(|size| size != uncompressed_size)
+        {
+            return Err(error_invalid_data("block size doesn't match block header"));
+        }
+
+        let check_type = self
+            .stream_header
+            .as_ref()
+            .expect("stream_header not set")
+            .check_type;
+        self.blocks.push(IndexRecord {
+            unpadded_size: header.header_size as u64 + compressed_size + check_type.checksum_size(),
+            uncompressed_size,
+        });
+
+        Ok(())
+    }
+
+    fn parse_index_and_footer(&mut self) -> Result<()> {
+        let index = Index::parse(&mut self.reader, self.blocks.len() as u64)?;
+
+        if index.number_of_records != self.blocks.len() as u64 {
             return Err(error_invalid_data(
                 "number of blocks processed doesn't match index records",
             ));
         }
 
+        if index.records != self.blocks {
+            return Err(error_invalid_data("index records don't match blocks"));
+        }
+
         let stream_footer = StreamFooter::parse(&mut self.reader)?;
+
+        if (stream_footer.backward_size as u64 + 1) * 4 != index.size {
+            return Err(error_invalid_data("backward size doesn't match index"));
+        }
 
         let header = self.stream_header.as_ref().expect("stream_header not set");
 
@@ -439,6 +480,7 @@ impl<R: Read> Read for XzReader<R> {
                     if let Some(ref mut calc) = self.checksum_calculator {
                         calc.update(&buf[..bytes_read]);
                     }
+                    self.block_uncompressed_size += bytes_read as u64;
 
                     return Ok(bytes_read);
                 } else {
@@ -451,6 +493,7 @@ impl<R: Read> Read for XzReader<R> {
 
                     self.consume_padding(compressed_bytes)?;
                     self.verify_block_checksum()?;
+                    self.finish_block(compressed_bytes)?;
                 }
             } else {
                 // No current block, prepare the next one.
@@ -502,6 +545,8 @@ pub struct XzStream {
     block_header_size: u64,
     block_compressed_size: u64,
     block_uncompressed_size: u64,
+    declared_compressed_size: Option<u64>,
+    declared_uncompressed_size: Option<u64>,
     index_records: Vec<IndexRecord>,
     index_crc: Crc32,
     index_size: usize,
@@ -534,6 +579,8 @@ impl XzStream {
             block_header_size: 0,
             block_compressed_size: 0,
             block_uncompressed_size: 0,
+            declared_compressed_size: None,
+            declared_uncompressed_size: None,
             index_records: Vec::new(),
             index_crc: Crc32::new(),
             index_size: 0,
@@ -880,6 +927,16 @@ impl XzStream {
         self.block_compressed_size = lzma2.total_in();
         self.block_uncompressed_size = lzma2.total_out();
 
+        if self
+            .declared_compressed_size
+            .is_some_and(|size| size != self.block_compressed_size)
+            || self
+                .declared_uncompressed_size
+                .is_some_and(|size| size != self.block_uncompressed_size)
+        {
+            return Err(error_invalid_data("block size doesn't match block header"));
+        }
+
         let pad_needed = ((4 - (self.block_compressed_size % 4)) % 4) as usize;
         if pad_needed > 0 {
             self.state = XzStreamState::BlockPadding;
@@ -992,7 +1049,13 @@ impl XzStream {
             return Err(error_invalid_data("block header CRC32 mismatch"));
         }
 
-        let (filters, properties, _) = BlockHeader::parse_from_slice(data)?;
+        let BlockHeader {
+            compressed_size,
+            uncompressed_size,
+            filters,
+            properties,
+            ..
+        } = BlockHeader::parse_from_slice(data)?;
 
         let mut lzma2_dict_size = 0u32;
         let mut found_lzma2 = false;
@@ -1042,6 +1105,8 @@ impl XzStream {
         self.block_header_size = header_size as u64;
         self.block_compressed_size = 0;
         self.block_uncompressed_size = 0;
+        self.declared_compressed_size = compressed_size;
+        self.declared_uncompressed_size = uncompressed_size;
 
         self.state = XzStreamState::Lzma2Data;
         self.accum.clear();
@@ -1220,6 +1285,12 @@ impl XzStream {
         }
         if self.check_type.map(|check_type| check_type as u8) != Some(data[9]) {
             return Err(error_invalid_data("stream footer flags don't match header"));
+        }
+
+        let backward_size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let index_size = 1 + self.index_size + (4 - ((1 + self.index_size) % 4)) % 4 + 4;
+        if (backward_size as u64 + 1) * 4 != index_size as u64 {
+            return Err(error_invalid_data("backward size doesn't match index"));
         }
 
         if self.allow_multiple_streams {

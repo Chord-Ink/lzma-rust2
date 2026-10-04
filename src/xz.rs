@@ -39,7 +39,7 @@ const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
 
 const XZ_FOOTER_MAGIC: [u8; 2] = *b"YZ";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct IndexRecord {
     unpadded_size: u64,
     uncompressed_size: u64,
@@ -49,6 +49,8 @@ struct IndexRecord {
 struct Index {
     pub number_of_records: u64,
     pub records: Vec<IndexRecord>,
+    /// Size in bytes from the index indicator through the CRC32.
+    pub size: u64,
 }
 
 #[derive(Debug)]
@@ -448,9 +450,7 @@ impl BlockHeader {
         }))
     }
 
-    pub fn parse_from_slice(
-        block_data: &[u8],
-    ) -> crate::Result<([Option<FilterType>; 4], [u32; 4], usize)> {
+    pub fn parse_from_slice(block_data: &[u8]) -> crate::Result<Self> {
         if block_data.is_empty() {
             return Err(error_invalid_data("Empty block data"));
         }
@@ -477,24 +477,26 @@ impl BlockHeader {
         let has_uncompressed_size = (block_flags & 0x80) != 0;
 
         let mut offset = 1;
+        let mut compressed_size = None;
+        let mut uncompressed_size = None;
 
-        // Skip optional compressed size.
         if has_compressed_size {
             if offset >= header_data.len() {
                 return Err(error_invalid_data(
                     "Block header too short for compressed size",
                 ));
             }
+            compressed_size = Some(parse_multibyte_integer(&header_data[offset..])?);
             offset += count_multibyte_integer_size(&header_data[offset..]);
         }
 
-        // Skip optional uncompressed size.
         if has_uncompressed_size {
             if offset >= header_data.len() {
                 return Err(error_invalid_data(
                     "Block header too short for uncompressed size",
                 ));
             }
+            uncompressed_size = Some(parse_multibyte_integer(&header_data[offset..])?);
             offset += count_multibyte_integer_size(&header_data[offset..]);
         }
 
@@ -625,7 +627,13 @@ impl BlockHeader {
             return Err(error_invalid_data("LZMA2 must be the last XZ block filter"));
         }
 
-        Ok((filters, properties, header_size))
+        Ok(BlockHeader {
+            header_size,
+            compressed_size,
+            uncompressed_size,
+            filters,
+            properties,
+        })
     }
 }
 
@@ -788,9 +796,14 @@ impl StreamFooter {
 }
 
 impl Index {
-    pub(crate) fn parse<R: Read>(reader: &mut R) -> crate::Result<Index> {
+    /// A record count above `max_records` is rejected before memory is reserved
+    /// for the records, so a forged count can't allocate more than the input backs.
+    pub(crate) fn parse<R: Read>(reader: &mut R, max_records: u64) -> crate::Result<Index> {
         // sic! index indicator already consumed
         let number_of_records = parse_multibyte_integer_from_reader(reader)?;
+        if number_of_records > max_records {
+            return Err(error_invalid_data("too many index records"));
+        }
         let mut records = Vec::new();
         records.try_reserve_exact(number_of_records as usize)?;
 
@@ -855,6 +868,7 @@ impl Index {
         Ok(Index {
             number_of_records,
             records,
+            size: (bytes_read + padding_needed + 4) as u64,
         })
     }
 }
@@ -947,7 +961,7 @@ fn scan_blocks<R: Read + Seek>(mut reader: R) -> io::Result<(R, Vec<Block>, Chec
         return Err(error_invalid_data("invalid XZ index indicator"));
     }
 
-    let index = Index::parse(&mut reader)?;
+    let index = Index::parse(&mut reader, index_size as u64 / 2)?;
 
     let mut blocks = Vec::new();
     let mut block_start_pos = header_end_pos;

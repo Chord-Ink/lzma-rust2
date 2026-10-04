@@ -140,7 +140,7 @@ impl<R: Read + Seek> XzReaderMt<R> {
             ));
         }
 
-        let (index_start_pos, _) = index_location(file_size, stream_footer.backward_size)?;
+        let (index_start_pos, index_size) = index_location(file_size, stream_footer.backward_size)?;
 
         reader.seek(SeekFrom::Start(index_start_pos))?;
 
@@ -151,7 +151,12 @@ impl<R: Read + Seek> XzReaderMt<R> {
             return Err(error_invalid_data("invalid XZ index indicator"));
         }
 
-        let index = Index::parse(&mut reader)?;
+        // Each record takes at least two bytes.
+        let index = Index::parse(&mut reader, index_size / 2)?;
+
+        if index.size != index_size {
+            return Err(error_invalid_data("backward size doesn't match index"));
+        }
 
         let mut block_start_pos = header_end_pos;
 
@@ -476,7 +481,12 @@ fn decompress_xz_block(
     check_type: CheckType,
     uncompressed_size: u64,
 ) -> io::Result<Vec<u8>> {
-    let (filters, properties, header_size) = BlockHeader::parse_from_slice(&block_data)?;
+    let BlockHeader {
+        header_size,
+        filters,
+        properties,
+        ..
+    } = BlockHeader::parse_from_slice(&block_data)?;
 
     let checksum_size = check_type.checksum_size() as usize;
     let padding_in_block_data = (4 - (block_data.len() % 4)) % 4;
